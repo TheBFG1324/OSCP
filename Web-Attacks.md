@@ -116,19 +116,110 @@ cd loot/git && git log --all --oneline
 git checkout <commit>      # often has plaintext creds in earlier commits
 ```
 
-### View source — what to grep for
+### View source — what to look for (do this on every page, every run)
 
+Ctrl-U on each page and skim top-to-bottom. You're looking for **things you wouldn't see in the rendered page**.
+
+#### HTML comments
+Devs leave gold here. Search for `<!--`.
 ```html
 <!-- TODO: remove before prod, creds admin:Welcome1 -->
-<input type="hidden" name="role" value="user">
-<!-- /api/v2/internal -->
-<script src="/js/app.bundle.js">     <!-- read it: endpoints, JWT keys, S3 buckets -->
+<!-- old login moved to /admin-old/ -->
+<!-- backup at /backup_2023.zip -->
+<!-- v1.2.3 -->                    <!-- version → searchsploit -->
 ```
 
+#### Hidden inputs & disabled buttons
+Often reveal privilege fields or features the UI is hiding from you.
+```html
+<input type="hidden" name="role" value="user">         <!-- change to admin -->
+<input type="hidden" name="price" value="100">         <!-- mass assignment -->
+<input type="hidden" name="debug" value="0">           <!-- flip to 1 -->
+<input type="hidden" name="redirect" value="/home">    <!-- open redirect / SSRF -->
+<button disabled>Admin Panel</button>                  <!-- remove disabled in DevTools, see what happens -->
+```
+
+#### Meta tags
+```html
+<meta name="generator" content="WordPress 5.7.2">    <!-- CMS + version -->
+<meta name="author" content="j.smith@acme.htb">      <!-- usernames + domain -->
+<meta name="csrf-token" content="...">                <!-- framework hint (Laravel, Rails) -->
+```
+
+#### Forms — read the `action`
+The form posts somewhere; that endpoint may not be linked anywhere else.
+```html
+<form action="/internal/api/v2/login" method="POST">  <!-- new endpoint to fuzz -->
+<form enctype="multipart/form-data">                  <!-- file upload! -->
+```
+
+#### `<script src=>` — pull and grep every JS file
+Most secrets live here, not in HTML.
 ```bash
-# pull all JS and grep
-wget -r -l 2 -A js http://target.htb/
-grep -RE "api|token|key|secret|password|/v[0-9]+/" .
+# Mirror all JS, then grep
+wget -r -l 2 -A js,map http://target.htb/ -nH -P loot/js/
+cd loot/js
+grep -REn 'api|token|secret|key|password|admin|bearer|aws_|firebase|jwt|debug' .
+grep -REn '/v[0-9]+/|/api/|/internal/|/admin/' .
+grep -REn '127\.0\.0\.1|localhost|10\.|172\.|192\.168' .
+```
+
+#### Inline JS — config objects, feature flags, role checks
+```javascript
+window.CONFIG = { apiKey: "AIza...", env: "dev", debug: true };
+const API_BASE = "/api/v3/";
+if (user.role === "admin") { /* hidden UI */ }    // shows admin endpoint names
+fetch("/internal/users")                           // XHR endpoints not in HTML
+```
+
+#### Source maps — jackpot if present
+If you see `//# sourceMappingURL=app.js.map` at the end of a JS file, fetch the `.map` — it contains the original (un-minified) source.
+```bash
+curl -s http://target.htb/js/app.js.map | jq -r '.sourcesContent[]' > app.original.js
+```
+
+#### Cookies (DevTools → Application or `curl -I`)
+- `PHPSESSID` / `JSESSIONID` / `ASP.NET_SessionId` / `laravel_session` → stack ID (see §4 table)
+- Missing `HttpOnly` → XSS can steal it
+- Missing `Secure` on HTTPS → MITM angle (rare on OSCP)
+- Cookie value looks base64 or JWT → decode it (`jwt.io`, `base64 -d`)
+- Custom cookies named `role`, `user`, `is_admin` → tamper directly
+
+#### Response headers (`curl -sI`)
+```
+Server: Apache/2.4.49              ← CVE candidate
+X-Powered-By: PHP/5.4.16           ← old runtime
+X-Debug-Token: ...                 ← Symfony profiler exposed?
+X-AspNet-Version, X-AspNetMvc-Version
+Location: http://internal.acme.htb ← vhost to add to /etc/hosts
+WWW-Authenticate: Basic / NTLM     ← which brute path to take
+```
+
+#### Favicon hash → app fingerprint
+```bash
+curl -s http://target.htb/favicon.ico | md5sum
+# Cross-ref against shodan favicon DB / Hunter / known-app lists.
+# Identical favicon to a known CMS → that's the CMS, regardless of headers.
+```
+
+#### DevTools tabs worth a 30-second look
+- **Network** — XHR/fetch endpoints the page calls that aren't in HTML (`/api/users/me`, `/internal/...`).
+- **Application → Storage** — localStorage / sessionStorage often hold JWTs, API keys, full user objects with role flags.
+- **Sources** — browse the JS tree; if source maps load, you see original filenames (`AdminController.ts`).
+- **Console** — devs leave `console.log` of internal state, sometimes creds.
+
+#### Quick "is anything weird" scans
+```bash
+# All inline comments across the site after crawling
+wget -r -l 2 -np -A html http://target.htb/
+grep -RoE '<!--.*?-->' . | sort -u
+
+# Email addresses → usernames for spray
+grep -RoE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+' . | sort -u > emails.txt
+cut -d@ -f1 emails.txt > users.txt
+
+# All hrefs/forms/scripts for endpoint discovery
+grep -RoE 'href="[^"]+"|action="[^"]+"|src="[^"]+"' . | sort -u
 ```
 
 ---
